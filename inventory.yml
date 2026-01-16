@@ -1,0 +1,42 @@
+# ==============================================================================
+# NetApp Health Check Inventory
+# ==============================================================================
+# This inventory defines all NetApp ONTAP clusters and StorageGRID grids
+# to be monitored by the daily health check playbook.
+#
+# IMPORTANT: Update the hostnames/IPs below with your actual systems
+# ==============================================================================
+
+all:
+  children:
+    # -------------------------------------------------------------------------
+    # ONTAP Clusters Group
+    # -------------------------------------------------------------------------
+    # Add all ONTAP clusters here. Each cluster needs:
+    #   - ansible_host: Management IP or hostname
+    #   - cluster_name: Friendly name for reports
+    # -------------------------------------------------------------------------
+    ontap_clusters:
+      hosts:
+        ontap_cluster_01:
+          ansible_host: "10.0.1.10"           # CHANGE: Cluster 1 management IP
+          cluster_name: "Production-Cluster"
+        ontap_cluster_02:
+          ansible_host: "10.0.1.11"           # CHANGE: Cluster 2 management IP
+          cluster_name: "DR-Cluster"
+        ontap_cluster_03:
+          ansible_host: "10.0.1.12"           # CHANGE: Cluster 3 management IP
+          cluster_name: "Dev-Cluster"
+
+    # -------------------------------------------------------------------------
+    # StorageGRID Grids Group
+    # -------------------------------------------------------------------------
+    # Add all StorageGRID admin nodes here. Each grid needs:
+    #   - ansible_host: Admin node IP or hostname
+    #   - grid_name: Friendly name for reports
+    # -------------------------------------------------------------------------
+    storagegrid_grids:
+      hosts:
+        storagegrid_01:
+          ansible_host: "10.0.2.10"           # CHANGE: StorageGRID admin node IP
+          grid_name: "Object-Storage-Grid"

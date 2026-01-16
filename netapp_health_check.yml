@@ -1,0 +1,858 @@
+# ==============================================================================
+# NetApp Daily Health Check Playbook
+# ==============================================================================
+# This playbook performs daily health checks on NetApp ONTAP clusters and
+# StorageGRID grids, generates an HTML report, and maintains CSV history.
+#
+# What this playbook does:
+#   1. Collects health and capacity data from ONTAP clusters
+#   2. Collects health and capacity data from StorageGRID grids
+#   3. Generates a consolidated HTML report
+#   4. Appends data to CSV files for historical tracking
+#   5. Cleans up CSV entries older than 90 days
+#
+# Requirements:
+#   - Collections: netapp.ontap, netapp.storagegrid
+#   - Credentials: ONTAP and StorageGRID usernames/passwords
+#
+# Author: Infrastructure Team
+# Version: 1.0
+# ==============================================================================
+---
+
+# ==============================================================================
+# PLAY 1: Gather ONTAP Cluster Data
+# ==============================================================================
+# This play runs against all ONTAP clusters and collects:
+#   - Cluster and node health status
+#   - Aggregate capacity utilization
+#   - Volume capacity utilization
+#   - SnapMirror relationship status and lag times
+# ==============================================================================
+- name: Gather ONTAP cluster health data
+  hosts: ontap_clusters
+  gather_facts: false
+  # ---------------------------------------------------------------------------
+  # Connection settings for ONTAP REST API
+  # These module_defaults apply to all netapp.ontap modules in this play
+  # ---------------------------------------------------------------------------
+  module_defaults:
+    group/netapp.ontap.netapp_ontap:
+      hostname: "{{ ansible_host }}"
+      username: "{{ ontap_username }}"
+      password: "{{ ontap_password }}"
+      https: "{{ ontap_https }}"
+      validate_certs: "{{ ontap_validate_certs }}"
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Task: Validate credentials are defined
+    # -------------------------------------------------------------------------
+    # Fail fast with clear error if credentials are missing.
+    # -------------------------------------------------------------------------
+    - name: Validate ONTAP credentials are defined
+      ansible.builtin.assert:
+        that:
+          - ontap_username is defined
+          - ontap_username | length > 0
+          - ontap_password is defined
+          - ontap_password | length > 0
+        fail_msg: "ERROR: ontap_username and ontap_password must be defined. Check AAP credential configuration."
+        quiet: true
+
+    # -------------------------------------------------------------------------
+    # Task: Get cluster information
+    # -------------------------------------------------------------------------
+    # Retrieves basic cluster info including name and health status.
+    # The cluster health is critical - if the cluster is unhealthy,
+    # all other metrics may be unreliable.
+    # -------------------------------------------------------------------------
+    - name: Get ONTAP cluster information
+      netapp.ontap.na_ontap_rest_info:
+        gather_subset:
+          - cluster/nodes
+        fields:
+          - '*'
+      register: ontap_cluster_info
+
+    # -------------------------------------------------------------------------
+    # Task: Get aggregate information
+    # -------------------------------------------------------------------------
+    # Aggregates are the physical storage containers.
+    # Monitoring their capacity prevents out-of-space conditions.
+    # -------------------------------------------------------------------------
+    - name: Get ONTAP aggregate information
+      netapp.ontap.na_ontap_rest_info:
+        gather_subset:
+          - storage/aggregates
+        fields:
+          - 'name'
+          - 'space'
+          - 'state'
+      register: ontap_aggregate_info
+
+    # -------------------------------------------------------------------------
+    # Task: Get volume information
+    # -------------------------------------------------------------------------
+    # Volumes are where data is actually stored.
+    # Volume capacity is often more critical than aggregate capacity
+    # because volumes can fill up even when aggregates have space.
+    # -------------------------------------------------------------------------
+    - name: Get ONTAP volume information
+      netapp.ontap.na_ontap_rest_info:
+        gather_subset:
+          - storage/volumes
+        fields:
+          - 'name'
+          - 'svm'
+          - 'space'
+          - 'state'
+        parameters:
+          is_svm_root: false
+      register: ontap_volume_info
+
+    # -------------------------------------------------------------------------
+    # Task: Get SnapMirror relationships
+    # -------------------------------------------------------------------------
+    # SnapMirror provides data replication for disaster recovery.
+    # Lag time indicates how far behind the destination is from source.
+    # High lag means potential data loss in a disaster scenario.
+    # -------------------------------------------------------------------------
+    - name: Get ONTAP SnapMirror relationships
+      netapp.ontap.na_ontap_rest_info:
+        gather_subset:
+          - snapmirror/relationships
+        fields:
+          - '*'
+      register: ontap_snapmirror_info
+
+    # -------------------------------------------------------------------------
+    # Task: Store cluster data for report generation
+    # -------------------------------------------------------------------------
+    # We save all collected data to a host fact so it can be accessed
+    # in the report generation play. This is necessary because each
+    # host's data is only available during that host's task execution.
+    # -------------------------------------------------------------------------
+    - name: Store ONTAP data as host fact
+      ansible.builtin.set_fact:
+        ontap_health_data:
+          cluster_name: "{{ cluster_name }}"
+          hostname: "{{ ansible_host }}"
+          nodes: "{{ ontap_cluster_info.ontap_info['cluster/nodes'].records | default([]) }}"
+          aggregates: "{{ ontap_aggregate_info.ontap_info['storage/aggregates'].records | default([]) }}"
+          volumes: "{{ ontap_volume_info.ontap_info['storage/volumes'].records | default([]) }}"
+          snapmirror: "{{ ontap_snapmirror_info.ontap_info['snapmirror/relationships'].records | default([]) }}"
+          collection_time: "{{ lookup('pipe', 'date -Iseconds') }}"
+
+
+# ==============================================================================
+# PLAY 2: Gather StorageGRID Data
+# ==============================================================================
+# This play runs against all StorageGRID admin nodes and collects:
+#   - Grid health status
+#   - Node health status for all 15 nodes
+#   - Storage capacity utilization
+# ==============================================================================
+- name: Gather StorageGRID health data
+  hosts: storagegrid_grids
+  gather_facts: false
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Task: Validate credentials are defined
+    # -------------------------------------------------------------------------
+    - name: Validate StorageGRID credentials are defined
+      ansible.builtin.assert:
+        that:
+          - storagegrid_username is defined
+          - storagegrid_username | length > 0
+          - storagegrid_password is defined
+          - storagegrid_password | length > 0
+        fail_msg: "ERROR: storagegrid_username and storagegrid_password must be defined. Check AAP credential configuration."
+        quiet: true
+
+    # -------------------------------------------------------------------------
+    # Task: Authenticate to StorageGRID
+    # -------------------------------------------------------------------------
+    # StorageGRID requires a two-step authentication:
+    # 1. POST credentials to /api/v3/authorize
+    # 2. Use the returned token for all subsequent API calls
+    # -------------------------------------------------------------------------
+    - name: Authenticate to StorageGRID and get token
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/api/v3/authorize"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ storagegrid_username }}"
+          password: "{{ storagegrid_password }}"
+          cookie: false
+          csrfToken: false
+        validate_certs: "{{ storagegrid_validate_certs }}"
+        return_content: true
+        status_code: 200
+      register: sg_auth_response
+
+    - name: Store StorageGRID auth token
+      ansible.builtin.set_fact:
+        sg_auth_token: "{{ sg_auth_response.json.data }}"
+
+    # -------------------------------------------------------------------------
+    # Task: Get StorageGRID grid health
+    # -------------------------------------------------------------------------
+    # Grid health gives an overall status of the entire StorageGRID system.
+    # This is checked first as it provides a quick pass/fail indicator.
+    # -------------------------------------------------------------------------
+    - name: Get StorageGRID grid health topology
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/api/v3/grid/health/topology"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ sg_auth_token }}"
+        validate_certs: "{{ storagegrid_validate_certs }}"
+        return_content: true
+      register: sg_health_topology
+
+    # -------------------------------------------------------------------------
+    # Task: Get StorageGRID node health
+    # -------------------------------------------------------------------------
+    # Individual node health helps identify which specific node
+    # is having issues when the grid health shows problems.
+    # -------------------------------------------------------------------------
+    - name: Get StorageGRID node health
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/api/v3/grid/node-health"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ sg_auth_token }}"
+        validate_certs: "{{ storagegrid_validate_certs }}"
+        return_content: true
+      register: sg_node_health
+
+    # -------------------------------------------------------------------------
+    # Task: Get StorageGRID storage usage
+    # -------------------------------------------------------------------------
+    # Storage capacity is critical for object storage systems.
+    # Running out of space can cause write failures for applications.
+    # -------------------------------------------------------------------------
+    - name: Get StorageGRID storage usage
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/api/v3/grid/storage-usage"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ sg_auth_token }}"
+        validate_certs: "{{ storagegrid_validate_certs }}"
+        return_content: true
+      register: sg_storage_usage
+
+    # -------------------------------------------------------------------------
+    # Task: Store StorageGRID data for report generation
+    # -------------------------------------------------------------------------
+    - name: Store StorageGRID data as host fact
+      ansible.builtin.set_fact:
+        storagegrid_health_data:
+          grid_name: "{{ grid_name }}"
+          hostname: "{{ ansible_host }}"
+          health_topology: "{{ sg_health_topology.json | default({}) }}"
+          node_health: "{{ sg_node_health.json | default({}) }}"
+          storage_usage: "{{ sg_storage_usage.json | default({}) }}"
+          collection_time: "{{ lookup('pipe', 'date -Iseconds') }}"
+
+
+# ==============================================================================
+# PLAY 3: Generate Reports and Maintain CSV History
+# ==============================================================================
+# This play runs on localhost (the AAP execution environment) and:
+#   - Creates the output directory if it doesn't exist
+#   - Generates the consolidated HTML report
+#   - Appends current data to CSV history files
+#   - Removes CSV entries older than 90 days
+# ==============================================================================
+- name: Generate health report and maintain CSV history
+  hosts: localhost
+  gather_facts: true
+  connection: local
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Task: Create output directory
+    # -------------------------------------------------------------------------
+    # Ensures the report directory exists before we try to write files.
+    # -------------------------------------------------------------------------
+    - name: Ensure report output directory exists
+      ansible.builtin.file:
+        path: "{{ report_output_dir }}"
+        state: directory
+        mode: '0755'
+
+    # -------------------------------------------------------------------------
+    # Task: Set report timestamp
+    # -------------------------------------------------------------------------
+    # Create a consistent timestamp used throughout the report.
+    # -------------------------------------------------------------------------
+    - name: Set report generation timestamp
+      ansible.builtin.set_fact:
+        report_timestamp: "{{ ansible_date_time.iso8601 }}"
+        report_date: "{{ ansible_date_time.date }}"
+
+    # -------------------------------------------------------------------------
+    # Task: Generate HTML Report
+    # -------------------------------------------------------------------------
+    # Creates a single HTML file with all health check results.
+    # The report uses inline CSS for email compatibility.
+    # Color coding: green=healthy, yellow=warning, red=critical
+    # -------------------------------------------------------------------------
+    - name: Generate consolidated HTML health report
+      ansible.builtin.copy:
+        dest: "{{ report_output_dir }}/{{ html_report_filename }}"
+        mode: '0644'
+        content: |
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="UTF-8">
+            <title>NetApp Daily Health Report - {{ report_date }}</title>
+            <style>
+              /* Base styles for email compatibility */
+              body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+              .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+              h1 { color: #1a237e; border-bottom: 3px solid #1a237e; padding-bottom: 10px; }
+              h2 { color: #283593; margin-top: 30px; border-bottom: 1px solid #ccc; padding-bottom: 5px; }
+              h3 { color: #3949ab; margin-top: 20px; }
+              table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+              th { background-color: #3949ab; color: white; padding: 12px 8px; text-align: left; }
+              td { padding: 10px 8px; border-bottom: 1px solid #ddd; }
+              tr:nth-child(even) { background-color: #f9f9f9; }
+              tr:hover { background-color: #f0f0f0; }
+              /* Status color classes */
+              .status-healthy { color: #2e7d32; font-weight: bold; }
+              .status-warning { color: #f57c00; font-weight: bold; }
+              .status-critical { color: #c62828; font-weight: bold; }
+              .status-unknown { color: #757575; font-weight: bold; }
+              /* Capacity bar visualization */
+              .capacity-bar { background-color: #e0e0e0; border-radius: 4px; height: 20px; width: 100px; display: inline-block; vertical-align: middle; }
+              .capacity-fill { height: 100%; border-radius: 4px; }
+              .capacity-green { background-color: #4caf50; }
+              .capacity-yellow { background-color: #ff9800; }
+              .capacity-red { background-color: #f44336; }
+              /* Summary box styles */
+              .summary-box { display: inline-block; padding: 15px 25px; margin: 10px; border-radius: 8px; text-align: center; min-width: 150px; }
+              .summary-good { background-color: #e8f5e9; border: 2px solid #4caf50; }
+              .summary-warn { background-color: #fff3e0; border: 2px solid #ff9800; }
+              .summary-bad { background-color: #ffebee; border: 2px solid #f44336; }
+              .summary-number { font-size: 32px; font-weight: bold; }
+              .summary-label { font-size: 14px; color: #666; }
+              .timestamp { color: #666; font-size: 12px; }
+              .section { margin-bottom: 30px; }
+            </style>
+          </head>
+          <body>
+            <div class="container">
+              <h1>NetApp Daily Health Report</h1>
+              <p class="timestamp">Generated: {{ report_timestamp }}</p>
+
+              <!-- ============================================================ -->
+              <!-- EXECUTIVE SUMMARY SECTION -->
+              <!-- ============================================================ -->
+              <div class="section">
+                <h2>Executive Summary</h2>
+                {% set ontap_hosts = groups['ontap_clusters'] | default([]) %}
+                {% set sg_hosts = groups['storagegrid_grids'] | default([]) %}
+
+                <!-- Count healthy vs unhealthy systems -->
+                {% set ns = namespace(ontap_healthy=0, ontap_warning=0, ontap_critical=0) %}
+                {% for host in ontap_hosts %}
+                {% set host_data = hostvars[host].ontap_health_data | default({}) %}
+                {% set nodes = host_data.nodes | default([]) %}
+                {% set all_up = true %}
+                {% for node in nodes %}
+                {% if node.state | default('unknown') != 'up' %}
+                {% set all_up = false %}
+                {% endif %}
+                {% endfor %}
+                {% if all_up and nodes | length > 0 %}
+                {% set ns.ontap_healthy = ns.ontap_healthy + 1 %}
+                {% else %}
+                {% set ns.ontap_critical = ns.ontap_critical + 1 %}
+                {% endif %}
+                {% endfor %}
+
+                <div style="text-align: center;">
+                  <div class="summary-box {% if ns.ontap_critical == 0 %}summary-good{% else %}summary-bad{% endif %}">
+                    <div class="summary-number">{{ ontap_hosts | length }}</div>
+                    <div class="summary-label">ONTAP Clusters</div>
+                  </div>
+                  <div class="summary-box summary-good">
+                    <div class="summary-number">{{ sg_hosts | length }}</div>
+                    <div class="summary-label">StorageGRID Grids</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- ============================================================ -->
+              <!-- ONTAP CLUSTERS SECTION -->
+              <!-- ============================================================ -->
+              <div class="section">
+                <h2>ONTAP Clusters</h2>
+
+                {% for host in ontap_hosts %}
+                {% set host_data = hostvars[host].ontap_health_data | default({}) %}
+                <h3>{{ host_data.cluster_name | default(host) }} ({{ host_data.hostname | default('N/A') }})</h3>
+
+                <!-- Node Health Table -->
+                <h4>Node Health Status</h4>
+                <table>
+                  <tr>
+                    <th>Node Name</th>
+                    <th>State</th>
+                    <th>Model</th>
+                    <th>Serial Number</th>
+                    <th>Uptime</th>
+                  </tr>
+                  {% for node in host_data.nodes | default([]) %}
+                  <tr>
+                    <td>{{ node.name | default('Unknown') }}</td>
+                    <td>
+                      {% if node.state | default('unknown') == 'up' %}
+                      <span class="status-healthy">UP</span>
+                      {% else %}
+                      <span class="status-critical">{{ node.state | default('UNKNOWN') | upper }}</span>
+                      {% endif %}
+                    </td>
+                    <td>{{ node.model | default('N/A') }}</td>
+                    <td>{{ node.serial_number | default('N/A') }}</td>
+                    <td>{{ node.uptime | default('N/A') }}</td>
+                  </tr>
+                  {% endfor %}
+                </table>
+
+                <!-- Aggregate Capacity Table -->
+                <h4>Aggregate Capacity</h4>
+                <table>
+                  <tr>
+                    <th>Aggregate Name</th>
+                    <th>State</th>
+                    <th>Total (GB)</th>
+                    <th>Used (GB)</th>
+                    <th>Available (GB)</th>
+                    <th>Used %</th>
+                    <th>Capacity</th>
+                  </tr>
+                  {% for aggr in host_data.aggregates | default([]) %}
+                  {% set total_bytes = aggr.space.block_storage.size | default(0) %}
+                  {% set used_bytes = aggr.space.block_storage.used | default(0) %}
+                  {% set avail_bytes = aggr.space.block_storage.available | default(0) %}
+                  {% set total_gb = (total_bytes / 1073741824) | round(1) %}
+                  {% set used_gb = (used_bytes / 1073741824) | round(1) %}
+                  {% set avail_gb = (avail_bytes / 1073741824) | round(1) %}
+                  {% set used_pct = ((used_bytes / total_bytes) * 100) | round(1) if total_bytes > 0 else 0 %}
+                  <tr>
+                    <td>{{ aggr.name | default('Unknown') }}</td>
+                    <td>
+                      {% if aggr.state | default('unknown') == 'online' %}
+                      <span class="status-healthy">ONLINE</span>
+                      {% else %}
+                      <span class="status-critical">{{ aggr.state | default('UNKNOWN') | upper }}</span>
+                      {% endif %}
+                    </td>
+                    <td>{{ total_gb }}</td>
+                    <td>{{ used_gb }}</td>
+                    <td>{{ avail_gb }}</td>
+                    <td>
+                      {% if used_pct >= capacity_critical_threshold %}
+                      <span class="status-critical">{{ used_pct }}%</span>
+                      {% elif used_pct >= capacity_warning_threshold %}
+                      <span class="status-warning">{{ used_pct }}%</span>
+                      {% else %}
+                      <span class="status-healthy">{{ used_pct }}%</span>
+                      {% endif %}
+                    </td>
+                    <td>
+                      <div class="capacity-bar">
+                        <div class="capacity-fill {% if used_pct >= capacity_critical_threshold %}capacity-red{% elif used_pct >= capacity_warning_threshold %}capacity-yellow{% else %}capacity-green{% endif %}" style="width: {{ used_pct }}%;"></div>
+                      </div>
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </table>
+
+                <!-- Volume Capacity Table (Top 20 by usage) -->
+                <h4>Volume Capacity (Top 20 by Usage)</h4>
+                <table>
+                  <tr>
+                    <th>Volume Name</th>
+                    <th>SVM</th>
+                    <th>State</th>
+                    <th>Total (GB)</th>
+                    <th>Used (GB)</th>
+                    <th>Used %</th>
+                  </tr>
+                  {% set volumes_with_pct = [] %}
+                  {% for vol in host_data.volumes | default([]) %}
+                  {% set total_bytes = vol.space.size | default(0) %}
+                  {% set used_bytes = vol.space.used | default(0) %}
+                  {% set used_pct = ((used_bytes / total_bytes) * 100) if total_bytes > 0 else 0 %}
+                  {% set _ = volumes_with_pct.append({'vol': vol, 'used_pct': used_pct}) %}
+                  {% endfor %}
+                  {% for item in (volumes_with_pct | sort(attribute='used_pct', reverse=true))[:20] %}
+                  {% set vol = item.vol %}
+                  {% set total_bytes = vol.space.size | default(0) %}
+                  {% set used_bytes = vol.space.used | default(0) %}
+                  {% set total_gb = (total_bytes / 1073741824) | round(1) %}
+                  {% set used_gb = (used_bytes / 1073741824) | round(1) %}
+                  {% set used_pct = item.used_pct | round(1) %}
+                  <tr>
+                    <td>{{ vol.name | default('Unknown') }}</td>
+                    <td>{{ vol.svm.name | default('N/A') }}</td>
+                    <td>
+                      {% if vol.state | default('unknown') == 'online' %}
+                      <span class="status-healthy">ONLINE</span>
+                      {% else %}
+                      <span class="status-warning">{{ vol.state | default('UNKNOWN') | upper }}</span>
+                      {% endif %}
+                    </td>
+                    <td>{{ total_gb }}</td>
+                    <td>{{ used_gb }}</td>
+                    <td>
+                      {% if used_pct >= capacity_critical_threshold %}
+                      <span class="status-critical">{{ used_pct }}%</span>
+                      {% elif used_pct >= capacity_warning_threshold %}
+                      <span class="status-warning">{{ used_pct }}%</span>
+                      {% else %}
+                      <span class="status-healthy">{{ used_pct }}%</span>
+                      {% endif %}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </table>
+
+                <!-- SnapMirror Relationships Table -->
+                <h4>SnapMirror Relationships</h4>
+                <table>
+                  <tr>
+                    <th>Source Path</th>
+                    <th>Destination Path</th>
+                    <th>State</th>
+                    <th>Health</th>
+                    <th>Lag Time</th>
+                    <th>Transfer Status</th>
+                  </tr>
+                  {% for sm in host_data.snapmirror | default([]) %}
+                  {# Parse ISO 8601 duration format (e.g., PT2H30M45S) #}
+                  {% set lag_str = sm.lag_time | default('PT0S') %}
+                  {% set hours_match = lag_str | regex_search('(\d+)H') %}
+                  {% set mins_match = lag_str | regex_search('(\d+)M') %}
+                  {% set secs_match = lag_str | regex_search('(\d+)S') %}
+                  {% set lag_h = (hours_match | regex_replace('H', '') | int) if hours_match else 0 %}
+                  {% set lag_m = (mins_match | regex_replace('M', '') | int) if mins_match else 0 %}
+                  {% set lag_s = (secs_match | regex_replace('S', '') | int) if secs_match else 0 %}
+                  {% set lag_hours = (lag_h + (lag_m / 60) + (lag_s / 3600)) | round(1) %}
+                  <tr>
+                    <td>{{ sm.source.path | default('N/A') }}</td>
+                    <td>{{ sm.destination.path | default('N/A') }}</td>
+                    <td>
+                      {% if sm.state | default('unknown') == 'snapmirrored' %}
+                      <span class="status-healthy">SNAPMIRRORED</span>
+                      {% elif sm.state | default('unknown') == 'uninitialized' %}
+                      <span class="status-warning">UNINITIALIZED</span>
+                      {% else %}
+                      <span class="status-warning">{{ sm.state | default('UNKNOWN') | upper }}</span>
+                      {% endif %}
+                    </td>
+                    <td>
+                      {% if sm.healthy | default(false) %}
+                      <span class="status-healthy">HEALTHY</span>
+                      {% else %}
+                      <span class="status-critical">UNHEALTHY</span>
+                      {% endif %}
+                    </td>
+                    <td>
+                      {% if lag_hours >= snapmirror_lag_critical_hours %}
+                      <span class="status-critical">{{ lag_hours }} hours</span>
+                      {% elif lag_hours >= snapmirror_lag_warning_hours %}
+                      <span class="status-warning">{{ lag_hours }} hours</span>
+                      {% else %}
+                      <span class="status-healthy">{{ lag_hours }} hours</span>
+                      {% endif %}
+                    </td>
+                    <td>{{ sm.transfer.state | default('idle') }}</td>
+                  </tr>
+                  {% endfor %}
+                  {% if host_data.snapmirror | default([]) | length == 0 %}
+                  <tr><td colspan="6">No SnapMirror relationships found</td></tr>
+                  {% endif %}
+                </table>
+
+                {% endfor %}
+              </div>
+
+              <!-- ============================================================ -->
+              <!-- STORAGEGRID SECTION -->
+              <!-- ============================================================ -->
+              <div class="section">
+                <h2>StorageGRID</h2>
+
+                {% for host in sg_hosts %}
+                {% set host_data = hostvars[host].storagegrid_health_data | default({}) %}
+                <h3>{{ host_data.grid_name | default(host) }} ({{ host_data.hostname | default('N/A') }})</h3>
+
+                <!-- Grid Health Summary -->
+                <h4>Grid Health Status</h4>
+                {% set topology = host_data.health_topology.data | default({}) %}
+                <table>
+                  <tr>
+                    <th>Metric</th>
+                    <th>Status</th>
+                  </tr>
+                  <tr>
+                    <td>Overall Grid Health</td>
+                    <td>
+                      {% set health = topology.health | default('unknown') %}
+                      {% if health == 'healthy' %}
+                      <span class="status-healthy">HEALTHY</span>
+                      {% elif health == 'degraded' %}
+                      <span class="status-warning">DEGRADED</span>
+                      {% else %}
+                      <span class="status-critical">{{ health | upper }}</span>
+                      {% endif %}
+                    </td>
+                  </tr>
+                </table>
+
+                <!-- Node Health Table -->
+                <h4>Node Health Status</h4>
+                <table>
+                  <tr>
+                    <th>Node Name</th>
+                    <th>Node Type</th>
+                    <th>Connection State</th>
+                    <th>Severity</th>
+                  </tr>
+                  {% for node in host_data.node_health.data | default([]) %}
+                  <tr>
+                    <td>{{ node.name | default('Unknown') }}</td>
+                    <td>{{ node.type | default('N/A') }}</td>
+                    <td>
+                      {% if node.connectionState | default('unknown') == 'connected' %}
+                      <span class="status-healthy">CONNECTED</span>
+                      {% else %}
+                      <span class="status-critical">{{ node.connectionState | default('UNKNOWN') | upper }}</span>
+                      {% endif %}
+                    </td>
+                    <td>
+                      {% set severity = node.severity | default('unknown') %}
+                      {% if severity == 'normal' %}
+                      <span class="status-healthy">NORMAL</span>
+                      {% elif severity == 'notice' or severity == 'minor' %}
+                      <span class="status-warning">{{ severity | upper }}</span>
+                      {% else %}
+                      <span class="status-critical">{{ severity | upper }}</span>
+                      {% endif %}
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </table>
+
+                <!-- Storage Capacity -->
+                <h4>Storage Capacity</h4>
+                {% set storage = host_data.storage_usage.data | default({}) %}
+                {% set total_bytes = storage.dataBytes | default(0) %}
+                {% set used_bytes = storage.objectDataBytes | default(0) %}
+                {% set total_tb = (total_bytes / 1099511627776) | round(2) %}
+                {% set used_tb = (used_bytes / 1099511627776) | round(2) %}
+                {% set used_pct = ((used_bytes / total_bytes) * 100) | round(1) if total_bytes > 0 else 0 %}
+                <table>
+                  <tr>
+                    <th>Total Capacity (TB)</th>
+                    <th>Used (TB)</th>
+                    <th>Used %</th>
+                    <th>Capacity</th>
+                  </tr>
+                  <tr>
+                    <td>{{ total_tb }}</td>
+                    <td>{{ used_tb }}</td>
+                    <td>
+                      {% if used_pct >= capacity_critical_threshold %}
+                      <span class="status-critical">{{ used_pct }}%</span>
+                      {% elif used_pct >= capacity_warning_threshold %}
+                      <span class="status-warning">{{ used_pct }}%</span>
+                      {% else %}
+                      <span class="status-healthy">{{ used_pct }}%</span>
+                      {% endif %}
+                    </td>
+                    <td>
+                      <div class="capacity-bar">
+                        <div class="capacity-fill {% if used_pct >= capacity_critical_threshold %}capacity-red{% elif used_pct >= capacity_warning_threshold %}capacity-yellow{% else %}capacity-green{% endif %}" style="width: {{ used_pct }}%;"></div>
+                      </div>
+                    </td>
+                  </tr>
+                </table>
+
+                {% endfor %}
+              </div>
+
+              <!-- ============================================================ -->
+              <!-- FOOTER -->
+              <!-- ============================================================ -->
+              <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #ccc; color: #666; font-size: 12px;">
+                <p>This report was automatically generated by Ansible Automation Platform.</p>
+                <p>Thresholds: Warning at {{ capacity_warning_threshold }}% | Critical at {{ capacity_critical_threshold }}%</p>
+                <p>SnapMirror Lag: Warning at {{ snapmirror_lag_warning_hours }} hours | Critical at {{ snapmirror_lag_critical_hours }} hours</p>
+              </div>
+
+            </div>
+          </body>
+          </html>
+
+    # -------------------------------------------------------------------------
+    # Task: Append ONTAP capacity data to CSV
+    # -------------------------------------------------------------------------
+    # This creates a running history of capacity metrics for trend analysis.
+    # Each row contains: date, cluster, aggregate, total, used, available, percent
+    # -------------------------------------------------------------------------
+    - name: Check if ONTAP capacity CSV exists
+      ansible.builtin.stat:
+        path: "{{ report_output_dir }}/{{ csv_ontap_capacity_file }}"
+      register: ontap_csv_stat
+
+    - name: Create ONTAP capacity CSV with header if missing
+      ansible.builtin.copy:
+        dest: "{{ report_output_dir }}/{{ csv_ontap_capacity_file }}"
+        content: "date,cluster_name,aggregate_name,total_gb,used_gb,available_gb,used_percent\n"
+        mode: '0644'
+      when: not ontap_csv_stat.stat.exists
+    - name: Append ONTAP capacity to CSV (per cluster)
+      ansible.builtin.shell: |
+        {% for host in groups['ontap_clusters'] | default([]) %}
+        {% set host_data = hostvars[host].ontap_health_data | default({}) %}
+        {% for aggr in host_data.aggregates | default([]) %}
+        {% set total_gb = (aggr.space.block_storage.size | default(0) / 1073741824) | round(1) %}
+        {% set used_gb = (aggr.space.block_storage.used | default(0) / 1073741824) | round(1) %}
+        {% set avail_gb = (aggr.space.block_storage.available | default(0) / 1073741824) | round(1) %}
+        {% set used_pct = ((aggr.space.block_storage.used | default(0) / aggr.space.block_storage.size) * 100) | round(1) if aggr.space.block_storage.size | default(0) > 0 else 0 %}
+        printf '%s,%s,%s,%s,%s,%s,%s\n' '{{ report_date }}' '{{ host_data.cluster_name | default("unknown") | replace("'", "'\''") }}' '{{ aggr.name | replace("'", "'\''") }}' '{{ total_gb }}' '{{ used_gb }}' '{{ avail_gb }}' '{{ used_pct }}' >> "{{ report_output_dir }}/{{ csv_ontap_capacity_file }}"
+        {% endfor %}
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    # -------------------------------------------------------------------------
+    # Task: Append SnapMirror data to CSV
+    # -------------------------------------------------------------------------
+    - name: Check if SnapMirror CSV exists
+      ansible.builtin.stat:
+        path: "{{ report_output_dir }}/{{ csv_snapmirror_file }}"
+      register: snapmirror_csv_stat
+
+    - name: Create SnapMirror CSV with header if missing
+      ansible.builtin.copy:
+        dest: "{{ report_output_dir }}/{{ csv_snapmirror_file }}"
+        content: "date,cluster_name,source_path,destination_path,state,healthy,lag_time\n"
+        mode: '0644'
+      when: not snapmirror_csv_stat.stat.exists
+
+    - name: Append SnapMirror data to CSV (per cluster)
+      ansible.builtin.shell: |
+        {% for host in groups['ontap_clusters'] | default([]) %}
+        {% set host_data = hostvars[host].ontap_health_data | default({}) %}
+        {% for sm in host_data.snapmirror | default([]) %}
+        {% set lag = sm.lag_time | default('PT0S') %}
+        printf '%s,%s,%s,%s,%s,%s,%s\n' '{{ report_date }}' '{{ host_data.cluster_name | default("unknown") | replace("'", "'\''") }}' '{{ sm.source.path | default("N/A") | replace("'", "'\''") }}' '{{ sm.destination.path | default("N/A") | replace("'", "'\''") }}' '{{ sm.state | default("unknown") }}' '{{ sm.healthy | default(false) }}' '{{ lag }}' >> "{{ report_output_dir }}/{{ csv_snapmirror_file }}"
+        {% endfor %}
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    # -------------------------------------------------------------------------
+    # Task: Append StorageGRID capacity data to CSV
+    # -------------------------------------------------------------------------
+    - name: Check if StorageGRID capacity CSV exists
+      ansible.builtin.stat:
+        path: "{{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}"
+      register: storagegrid_csv_stat
+
+    - name: Create StorageGRID capacity CSV with header if missing
+      ansible.builtin.copy:
+        dest: "{{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}"
+        content: "date,grid_name,total_tb,used_tb,used_percent\n"
+        mode: '0644'
+      when: not storagegrid_csv_stat.stat.exists
+
+    - name: Append StorageGRID capacity to CSV
+      ansible.builtin.shell: |
+        {% for host in groups['storagegrid_grids'] | default([]) %}
+        {% set host_data = hostvars[host].storagegrid_health_data | default({}) %}
+        {% set storage = host_data.storage_usage.data | default({}) %}
+        {% set total_tb = (storage.dataBytes | default(0) / 1099511627776) | round(2) %}
+        {% set used_tb = (storage.objectDataBytes | default(0) / 1099511627776) | round(2) %}
+        {% set used_pct = ((storage.objectDataBytes | default(0) / storage.dataBytes) * 100) | round(1) if storage.dataBytes | default(0) > 0 else 0 %}
+        printf '%s,%s,%s,%s,%s\n' '{{ report_date }}' '{{ host_data.grid_name | default("unknown") | replace("'", "'\''") }}' '{{ total_tb }}' '{{ used_tb }}' '{{ used_pct }}' >> "{{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}"
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    # -------------------------------------------------------------------------
+    # Task: Clean up old CSV entries (older than 90 days)
+    # -------------------------------------------------------------------------
+    # This keeps the CSV files from growing indefinitely.
+    # We use awk to filter out lines with dates older than the retention period.
+    # -------------------------------------------------------------------------
+    - name: Calculate cutoff date for CSV retention
+      ansible.builtin.set_fact:
+        csv_cutoff_date: "{{ '%Y-%m-%d' | strftime((ansible_date_time.epoch | int) - (csv_retention_days * 86400)) }}"
+
+    - name: Clean old entries from ONTAP capacity CSV
+      ansible.builtin.shell: |
+        if [ -f "{{ report_output_dir }}/{{ csv_ontap_capacity_file }}" ]; then
+          # Keep header and lines with dates >= cutoff date
+          awk -F',' 'NR==1 || $1 >= "{{ csv_cutoff_date }}"' \
+            "{{ report_output_dir }}/{{ csv_ontap_capacity_file }}" > \
+            "{{ report_output_dir }}/{{ csv_ontap_capacity_file }}.tmp" && \
+          mv "{{ report_output_dir }}/{{ csv_ontap_capacity_file }}.tmp" \
+            "{{ report_output_dir }}/{{ csv_ontap_capacity_file }}"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Clean old entries from SnapMirror CSV
+      ansible.builtin.shell: |
+        if [ -f "{{ report_output_dir }}/{{ csv_snapmirror_file }}" ]; then
+          awk -F',' 'NR==1 || $1 >= "{{ csv_cutoff_date }}"' \
+            "{{ report_output_dir }}/{{ csv_snapmirror_file }}" > \
+            "{{ report_output_dir }}/{{ csv_snapmirror_file }}.tmp" && \
+          mv "{{ report_output_dir }}/{{ csv_snapmirror_file }}.tmp" \
+            "{{ report_output_dir }}/{{ csv_snapmirror_file }}"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Clean old entries from StorageGRID capacity CSV
+      ansible.builtin.shell: |
+        if [ -f "{{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}" ]; then
+          awk -F',' 'NR==1 || $1 >= "{{ csv_cutoff_date }}"' \
+            "{{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}" > \
+            "{{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}.tmp" && \
+          mv "{{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}.tmp" \
+            "{{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    # -------------------------------------------------------------------------
+    # Task: Display report location
+    # -------------------------------------------------------------------------
+    - name: Display report completion message
+      ansible.builtin.debug:
+        msg: |
+          Health check complete!
+          HTML Report: {{ report_output_dir }}/{{ html_report_filename }}
+          CSV Files:
+            - {{ report_output_dir }}/{{ csv_ontap_capacity_file }}
+            - {{ report_output_dir }}/{{ csv_snapmirror_file }}
+            - {{ report_output_dir }}/{{ csv_storagegrid_capacity_file }}

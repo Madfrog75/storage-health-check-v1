@@ -1,0 +1,45 @@
+# Ansible specific
+*.retry
+inventory/*.ini
+!inventory/example.ini
+
+# Python
+*.pyc
+__pycache__/
+*.pyo
+.Python
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ansible Galaxy roles (if downloaded)
+roles/galaxy/
+
+# Sensitive files - NEVER commit these
+*.vault
+*vault*.yml
+!*vault*.yml.example
+credentials.yml
+secrets.yml
+passwords.yml
+
+# Local testing artifacts
+*.log
+*.tmp
+
+# Report output files (generated at runtime)
+*.html
+*.csv
+
+# AAP/AWX artifacts
+artifacts/

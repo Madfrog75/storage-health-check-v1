@@ -1,0 +1,67 @@
+# ==============================================================================
+# NetApp Health Check - Global Configuration
+# ==============================================================================
+# All configurable settings for the health check playbook.
+# Update these values to match your environment.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# ONTAP Connection Settings
+# ------------------------------------------------------------------------------
+# These credentials are used to connect to all ONTAP clusters.
+# In AAP, these should come from a credential, not stored here.
+# The playbook expects these variables to be provided by AAP credentials.
+# ------------------------------------------------------------------------------
+# ontap_username: "{{ lookup('env', 'ONTAP_USERNAME') }}"  # Set via AAP credential
+# ontap_password: "{{ lookup('env', 'ONTAP_PASSWORD') }}"  # Set via AAP credential
+ontap_https: true                    # Use HTTPS for API connections
+ontap_validate_certs: false          # Skip SSL certificate validation
+
+# ------------------------------------------------------------------------------
+# StorageGRID Connection Settings
+# ------------------------------------------------------------------------------
+# These credentials are used to connect to all StorageGRID grids.
+# In AAP, these should come from a credential, not stored here.
+# The playbook authenticates to get an API token, then uses it for all API calls.
+# ------------------------------------------------------------------------------
+# storagegrid_username: "your_username"  # Set via AAP credential (extra_vars)
+# storagegrid_password: "your_password"  # Set via AAP credential (extra_vars)
+storagegrid_validate_certs: false    # Skip SSL certificate validation
+
+# ------------------------------------------------------------------------------
+# Capacity Thresholds (percentage)
+# ------------------------------------------------------------------------------
+# These thresholds determine the color coding in the HTML report:
+#   - Green: Below warning threshold
+#   - Yellow: Between warning and critical
+#   - Red: At or above critical threshold
+# ------------------------------------------------------------------------------
+capacity_warning_threshold: 80       # Show yellow warning at 80% used
+capacity_critical_threshold: 90      # Show red critical at 90% used
+
+# ------------------------------------------------------------------------------
+# SnapMirror Lag Thresholds (hours)
+# ------------------------------------------------------------------------------
+# SnapMirror relationships exceeding these lag times will be flagged.
+# ------------------------------------------------------------------------------
+snapmirror_lag_warning_hours: 4      # Yellow warning if lag > 4 hours
+snapmirror_lag_critical_hours: 24    # Red critical if lag > 24 hours
+
+# ------------------------------------------------------------------------------
+# Report Settings
+# ------------------------------------------------------------------------------
+# Configure where reports are saved and how long to keep historical data.
+# ------------------------------------------------------------------------------
+report_output_dir: "/var/lib/awx/netapp_reports"    # Directory for all output files
+html_report_filename: "netapp_health_report.html"   # HTML report filename
+csv_retention_days: 90                              # Days to keep CSV history
+
+# ------------------------------------------------------------------------------
+# CSV Historical Data Files
+# ------------------------------------------------------------------------------
+# These files accumulate daily data for trend analysis.
+# Each row includes a timestamp and the metrics for that day.
+# ------------------------------------------------------------------------------
+csv_ontap_capacity_file: "ontap_capacity_history.csv"
+csv_storagegrid_capacity_file: "storagegrid_capacity_history.csv"
+csv_snapmirror_file: "snapmirror_history.csv"
